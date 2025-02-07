@@ -21,7 +21,7 @@ def prepare_pdb(input_pdb, output_pdb):
     fixer.findMissingAtoms()
     fixer.addMissingAtoms()
     
-    # Save the fixed PDB file
+    # Saves the fixed PDB file
     with open(output_pdb, 'w') as f:
         PDBFile.writeFile(fixer.topology, fixer.positions, f)
     print(f"Fixed PDB saved to {output_pdb}")
