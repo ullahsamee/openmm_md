@@ -1,3 +1,4 @@
+#!/usr/bin/env python
 from openmm import app, unit
 from openmm.app import PDBFile, Modeller, ForceField, Simulation, DCDReporter, StateDataReporter
 from openmm import LangevinMiddleIntegrator, Platform, MonteCarloBarostat
@@ -5,238 +6,211 @@ from pdbfixer import PDBFixer
 import mdtraj as md
 import numpy as np
 import os
+import argparse
+from sys import exit
 
-# Step 1: Prepare the PDB file
+def parse_arguments():
+    """Parse command-line arguments for simulation configuration"""
+    parser = argparse.ArgumentParser(description="Molecular Dynamics Simulation Workflow")
+    
+    parser.add_argument("-i", "--input", required=True, help="Input PDB file")
+    parser.add_argument("-o", "--output", default="output", help="Base name for output files")
+    parser.add_argument("--gpu", type=int, default=0, help="GPU device index")
+    parser.add_argument("--steps", type=int, default=250000000, 
+                      help="Production simulation steps (default: 500ns)")
+    parser.add_argument("--chains", nargs=2, default=["chainid 0", "chainid 1"],
+                      help="Chain selections for MM/PBSA calculation")
+    
+    return parser.parse_args()
+
 def prepare_pdb(input_pdb, output_pdb):
-    """
-    Prepares the PDB file by fixing missing residues, atoms, and non-standard residues.
-    """
-    print("Preparing PDB file...")
+    """Fix PDB structure and add missing components"""
+    if not os.path.exists(input_pdb):
+        raise FileNotFoundError(f"Input PDB {input_pdb} not found")
+    
+    print(f"\n{' PREPARING PDB STRUCTURE ':=^80}")
     fixer = PDBFixer(input_pdb)
     
-    # Fix missing residues, atoms, and non-standard residues
-    fixer.findMissingResidues()
-    fixer.findNonstandardResidues()
-    fixer.replaceNonstandardResidues()
-    fixer.findMissingAtoms()
-    fixer.addMissingAtoms()
+    # Apply standard fixes
+    operations = [
+        ("Finding missing residues", fixer.findMissingResidues),
+        ("Identifying non-standard residues", fixer.findNonstandardResidues),
+        ("Replacing non-standard residues", fixer.replaceNonstandardResidues),
+        ("Locating missing atoms", fixer.findMissingAtoms),
+        ("Adding missing atoms", fixer.addMissingAtoms)
+    ]
     
-    # Saves the fixed PDB file
+    for desc, op in operations:
+        print(f"> {desc}")
+        op()
+    
+    print(f"\nSaving fixed PDB to {output_pdb}")
     with open(output_pdb, 'w') as f:
         PDBFile.writeFile(fixer.topology, fixer.positions, f)
-    print(f"Fixed PDB saved to {output_pdb}")
 
-# Step 2: Load the system and define the force field
-def load_system(pdb_file):
-    """
-    Loads the PDB file and defines the force field (AMBER ff15ipq for protein and TIP3P for water).
-    """
-    print("Loading system and defining force field...")
+def setup_system(pdb_file, output_base):
+    """Initialize molecular system and force field"""
+    print(f"\n{' SYSTEM SETUP ':=^80}")
     pdb = PDBFile(pdb_file)
-    
-    # Define the force field (AMBER ff15ipq for protein and TIP3P for water)
     forcefield = ForceField('amber14/protein.ff15ipq.xml', 'amber14/tip3pfb.xml')
     
-    # Create a Modeller object
+    print("Creating molecular model...")
     modeller = Modeller(pdb.topology, pdb.positions)
     
-    # Add solvent (water box with 1.0 nm padding and 0.15 M ionic strength)
-    print("Adding solvent...")
-    modeller.addSolvent(forcefield, padding=1.0*unit.nanometers, ionicStrength=0.15*unit.molar)
+    print("\nSolvating system with TIP3P water:")
+    print(f"- Padding: 1.0 nm\n- Ionic strength: 0.15 M")
+    modeller.addSolvent(forcefield, padding=1.0*unit.nanometers, 
+                      ionicStrength=0.15*unit.molar)
     
-    # Save the solvated system (optional)
-    with open('solvated_complex.pdb', 'w') as f:
+    solvated_pdb = f"{output_base}_solvated.pdb"
+    print(f"Saving solvated system to {solvated_pdb}")
+    with open(solvated_pdb, 'w') as f:
         PDBFile.writeFile(modeller.topology, modeller.positions, f)
-    print("Solvated system saved to solvated_complex.pdb")
     
-    return modeller, forcefield
+    return modeller, forcefield, solvated_pdb
 
-# Step 3: Create the OpenMM system
-def create_system(modeller, forcefield):
-    """
-    Creates the OpenMM system with the specified force field and simulation parameters.
-    """
-    print("Creating OpenMM system...")
-    system = forcefield.createSystem(modeller.topology, 
-                                     nonbondedMethod=app.PME, 
-                                     nonbondedCutoff=1.0*unit.nanometers, 
-                                     constraints=app.HBonds, 
-                                     rigidWater=True, 
-                                     ewaldErrorTolerance=0.0005)
+def configure_simulation(modeller, forcefield, gpu_index=0):
+    """Create and configure OpenMM simulation"""
+    print(f"\n{' SIMULATION CONFIGURATION ':=^80}")
+    print("Creating system with force field parameters:")
+    print("- PME electrostatics\n- 1.0 nm cutoff\n- HBond constraints\n- Rigid water")
+    system = forcefield.createSystem(modeller.topology,
+                                   nonbondedMethod=app.PME,
+                                   nonbondedCutoff=1.0*unit.nanometers,
+                                   constraints=app.HBonds,
+                                   rigidWater=True,
+                                   ewaldErrorTolerance=0.0005)
     
-    # Add a barostat for NPT simulations (1 atm, 300 K)
-    barostat = MonteCarloBarostat(1.0*unit.atmospheres, 300*unit.kelvin, 25)
-    system.addForce(barostat)
+    print("\nAdding barostat for NPT ensemble (1 atm, 300 K)")
+    system.addForce(MonteCarloBarostat(1.0*unit.atmospheres, 300*unit.kelvin, 25))
     
-    return system
-
-# Step 4: Set up the simulation
-def setup_simulation(modeller, system, gpu_index=0):
-    """
-    Sets up the simulation with the Langevin Middle Integrator and platform.
-    """
-    print("Setting up simulation...")
-    # Define the integrator (Langevin Middle Integrator, 300 K, 1 ps^-1 friction, 2 fs time step)
-    integrator = LangevinMiddleIntegrator(300*unit.kelvin, 1/unit.picosecond, 0.002*unit.picoseconds)
+    print("\nConfiguring integration parameters:")
+    print("- Langevin Middle Integrator\n- 300 K\n- 1 ps⁻¹ friction\n- 2 fs timestep")
+    integrator = LangevinMiddleIntegrator(300*unit.kelvin, 1/unit.picosecond, 
+                                        0.002*unit.picoseconds)
     
-    # Choose the platform (CUDA, OpenCL, or CPU)
-    platform = Platform.getPlatformByName('CUDA')  # Change to 'OpenCL' or 'CPU' if needed
-    
-    # Set the GPU device index
+    platform = Platform.getPlatformByName('CUDA')
     platform.setPropertyDefaultValue('DeviceIndex', str(gpu_index))
     
-    # Create the simulation object
     simulation = Simulation(modeller.topology, system, integrator, platform)
-    
-    # Set initial positions
     simulation.context.setPositions(modeller.positions)
     
-    # Center the protein in the box
-    simulation.context.computeVirtualSites()
-    simulation.context.applyConstraints(1e-5)
-    simulation.context.computeVirtualSites()
-    
+    print("\nSystem initialization complete")
     return simulation
 
-# Step 5: Minimize and equilibrate the system
-def minimize_and_equilibrate(simulation):
-    """
-    Minimizes the energy and equilibrates the system in NVT and NPT ensembles.
-    """
-    print("Minimizing energy...")
+def run_simulation(simulation, output_base, production_steps):
+    """Execute energy minimization and MD simulation"""
+    print(f"\n{' RUNNING SIMULATION ':=^80}")
+    
+    # Energy minimization
+    print("\nStarting energy minimization")
     simulation.minimizeEnergy()
     
-    # NVT equilibration (100 ps)
-    print("NVT equilibration...")
-    simulation.context.setVelocitiesToTemperature(300*unit.kelvin)
-    simulation.step(50000)  # 100 ps (50000 steps * 0.002 ps/step)
+    # Equilibration phases
+    print("\nEquilibration phases:")
+    for phase, steps in [("NVT", 50000), ("NPT", 50000)]:
+        print(f"- {phase} equilibration (100 ps)")
+        simulation.context.setVelocitiesToTemperature(300*unit.kelvin)
+        simulation.step(steps)
     
-    # NPT equilibration (100 ps)
-    print("NPT equilibration...")
-    simulation.step(50000)  # 100 ps (50000 steps * 0.002 ps/step)
+    # Production run
+    traj_file = f"{output_base}.dcd"
+    log_file = f"{output_base}.log"
+    
+    print(f"\nStarting production run ({production_steps} steps)")
+    simulation.reporters = [
+        DCDReporter(traj_file, 100000),
+        StateDataReporter(log_file, 100000,
+                        step=True,
+                        potentialEnergy=True,
+                        temperature=True,
+                        volume=True,
+                        progress=True,
+                        remainingTime=True,
+                        speed=True,
+                        totalSteps=production_steps)
+    ]
+    
+    simulation.step(production_steps)
+    return traj_file, log_file
 
-# Step 6: Run production simulation
-def run_production(simulation, output_dcd, output_log, steps=250000000):
-    """
-    Runs the production simulation and saves the trajectory and logs.
-    """
-    print("Running production simulation...")
-    # Save trajectory (DCD format, every 100,000 steps)
-    simulation.reporters.append(DCDReporter(output_dcd, 100000))
+def calculate_binding_affinity(traj_file, top_file, chain_selections):
+    """Perform MM/PBSA binding free energy calculation"""
+    print(f"\n{' BINDING AFFINITY CALCULATION ':=^80}")
     
-    # Save simulation logs (every 100,000 steps)
-    simulation.reporters.append(StateDataReporter(output_log, 100000, 
-                                                  step=True, 
-                                                  potentialEnergy=True, 
-                                                  temperature=True, 
-                                                  volume=True,
-                                                  progress=True,
-                                                  remainingTime=True,
-                                                  speed=True,
-                                                  totalSteps=steps))  # Add totalSteps parameter
+    print("Loading trajectory and processing...")
+    traj = md.load(traj_file, top=top_file)
     
-    # Run the simulation (500 ns by default)
-    simulation.step(steps)  # 500 ns (250000000 steps * 0.002 ps/step)
-
-# Step 7: Calculate binding affinity using MM/PBSA
-def calculate_binding_affinity(trajectory_file, topology_file, chain_a_selection, chain_b_selection):
-    """
-    Calculates the binding affinity using MM/PBSA between two chains (e.g., chain A and chain B).
-    """
-    print("Calculating binding affinity using MM/PBSA...")
+    print("\nSelecting protein chains:")
+    selections = [f"Chain selection {i+1}: {sel}" 
+                for i, sel in enumerate(chain_selections)]
+    print("\n".join(selections))
     
-    # Load the trajectory and topology
-    traj = md.load(trajectory_file, top=topology_file)
+    chain_a = traj.topology.select(chain_selections[0])
+    chain_b = traj.topology.select(chain_selections[1])
+    complex_atoms = np.concatenate([chain_a, chain_b])
     
-    # Select atoms for chain A and chain B
-    chain_a_atoms = traj.topology.select(chain_a_selection)
-    chain_b_atoms = traj.topology.select(chain_b_selection)
+    print("\nCalculating potential energies:")
+    energy_components = {
+        "Complex": traj.atom_slice(complex_atoms),
+        "Chain A": traj.atom_slice(chain_a),
+        "Chain B": traj.atom_slice(chain_b)
+    }
     
-    # Combine chain A and chain B atoms
-    complex_atoms = np.concatenate([chain_a_atoms, chain_b_atoms])
-    
-    # Create trajectories for complex, chain A, and chain B
-    traj_complex = traj.atom_slice(complex_atoms)
-    traj_chain_a = traj.atom_slice(chain_a_atoms)
-    traj_chain_b = traj.atom_slice(chain_b_atoms)
-    
-    # Calculate MM/PBSA energy terms
-    from openmm.app import PDBFile, Simulation, StateDataReporter
-    from openmm import MonteCarloBarostat, Platform
-    from openmm.unit import kilocalories_per_mole
-    
-    # Load the force field
-    forcefield = ForceField('amber14/protein.ff15ipq.xml', 'amber14/tip3pfb.xml')
-    
-    # Create systems for complex, chain A, and chain B
-    system_complex = forcefield.createSystem(traj_complex.topology.to_openmm(), 
-                                             nonbondedMethod=app.NoCutoff, 
-                                             constraints=app.HBonds)
-    system_chain_a = forcefield.createSystem(traj_chain_a.topology.to_openmm(), 
-                                             nonbondedMethod=app.NoCutoff, 
-                                             constraints=app.HBonds)
-    system_chain_b = forcefield.createSystem(traj_chain_b.topology.to_openmm(), 
-                                             nonbondedMethod=app.NoCutoff, 
-                                             constraints=app.HBonds)
-    
-    # Create simulations
-    integrator = LangevinMiddleIntegrator(300*unit.kelvin, 1/unit.picosecond, 0.002*unit.picoseconds)
-    platform = Platform.getPlatformByName('CPU')  # Use CPU for MM/PBSA calculations
-    simulation_complex = Simulation(traj_complex.topology.to_openmm(), system_complex, integrator, platform)
-    simulation_chain_a = Simulation(traj_chain_a.topology.to_openmm(), system_chain_a, integrator, platform)
-    simulation_chain_b = Simulation(traj_chain_b.topology.to_openmm(), system_chain_b, integrator, platform)
-    
-    # Calculate energies for the complex, chain A, and chain B
-    complex_energies = []
-    chain_a_energies = []
-    chain_b_energies = []
-    
-    for frame in traj_complex:
-        # Complex energy
-        simulation_complex.context.setPositions(frame.positions)
-        state_complex = simulation_complex.context.getState(getEnergy=True)
-        complex_energies.append(state_complex.getPotentialEnergy().value_in_unit(kilocalories_per_mole))
+    results = {}
+    for name, system in energy_components.items():
+        print(f"- Processing {name}")
+        ff = ForceField('amber14/protein.ff15ipq.xml', 'amber14/tip3pfb.xml')
+        omm_top = system.topology.to_openmm()
         
-        # Chain A energy
-        simulation_chain_a.context.setPositions(frame.positions[:len(chain_a_atoms)])
-        state_chain_a = simulation_chain_a.context.getState(getEnergy=True)
-        chain_a_energies.append(state_chain_a.getPotentialEnergy().value_in_unit(kilocalories_per_mole))
+        system = ff.createSystem(omm_top, 
+                               nonbondedMethod=app.NoCutoff,
+                               constraints=app.HBonds)
         
-        # Chain B energy
-        simulation_chain_b.context.setPositions(frame.positions[len(chain_a_atoms):])
-        state_chain_b = simulation_chain_b.context.getState(getEnergy=True)
-        chain_b_energies.append(state_chain_b.getPotentialEnergy().value_in_unit(kilocalories_per_mole))
+        integrator = LangevinMiddleIntegrator(300*unit.kelvin, 
+                                           1/unit.picosecond, 
+                                           0.002*unit.picoseconds)
+        simulation = Simulation(omm_top, system, integrator, 
+                              Platform.getPlatformByName('CPU'))
+        
+        energies = []
+        for frame in system.positions:
+            simulation.context.setPositions(frame)
+            state = simulation.context.getState(getEnergy=True)
+            energies.append(state.getPotentialEnergy().value_in_unit(
+                unit.kilocalories_per_mole))
+        
+        results[name] = np.mean(energies)
     
-    # Calculate binding free energy
-    binding_energy = np.mean(complex_energies) - np.mean(chain_a_energies) - np.mean(chain_b_energies)
-    print(f"Binding affinity (MM/PBSA) between chain A and chain B: {binding_energy:.2f} kcal/mol")
+    binding_energy = results["Complex"] - results["Chain A"] - results["Chain B"]
+    print(f"\nFinal binding affinity: {binding_energy:.2f} kcal/mol")
+    return binding_energy
 
+def main():
+    args = parse_arguments()
+    
+    try:
+        # Structure preparation
+        fixed_pdb = f"{args.output}_fixed.pdb"
+        prepare_pdb(args.input, fixed_pdb)
+        
+        # System setup
+        modeller, forcefield, solvated_pdb = setup_system(fixed_pdb, args.output)
+        
+        # Simulation configuration
+        simulation = configure_simulation(modeller, forcefield, args.gpu)
+        
+        # Run simulation
+        traj_file, log_file = run_simulation(simulation, args.output, args.steps)
+        
+        # Binding affinity calculation
+        calculate_binding_affinity(traj_file, solvated_pdb, args.chains)
+        
+        print("\nSimulation workflow completed successfully")
+        
+    except Exception as e:
+        print(f"\nERROR: {str(e)}")
+        exit(1)
 
 if __name__ == "__main__":
-    input_pdb = "complex.pdb"
-    fixed_pdb = "fixed_complex.pdb"
-    
-    # Step 1: Prepare the PDB file
-    if not os.path.exists(input_pdb):
-        raise FileNotFoundError(f"Input PDB file '{input_pdb}' not found.")
-    prepare_pdb(input_pdb, fixed_pdb)
-    
-    # Step 2: Load the system and define the force field
-    modeller, forcefield = load_system(fixed_pdb)
-    
-    # Step 3: Create the OpenMM system
-    system = create_system(modeller, forcefield)
-    
-    # Step 4: Set up the simulation (specify GPU index here, e.g., 0 for the first GPU)
-    simulation = setup_simulation(modeller, system, gpu_index=0)
-    
-    # Step 5: Minimize and equilibrate
-    minimize_and_equilibrate(simulation)
-    
-    # Step 6: Run production simulation
-    run_production(simulation, "trajectory.dcd", "log.txt", steps=250000000)
-    
-    # Step 7: Calculate binding affinity between chain A and chain B
-    calculate_binding_affinity("trajectory.dcd", "solvated_complex.pdb", "chainid 0", "chainid 1")
-    
-    print("Simulation and binding affinity calculation complete!")
+    main()
